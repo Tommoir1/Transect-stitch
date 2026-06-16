@@ -13,9 +13,11 @@ from .metadata import (
     ORDER_FILENAME,
     ORDER_GPS,
     ORDER_TIME,
+    chunk_frames,
     gps_gaps_m,
     load_frame_infos,
     order_frames,
+    stride_frames,
 )
 
 
@@ -64,6 +66,19 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=12,
         help="Minimum good matches to accept a pair (default: 12).",
+    )
+    p.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="Use every Nth frame (default: 1). Thins dense time-lapses with heavy overlap.",
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="Batch mode: emit one mosaic per N frames (e.g. 40). With this set, "
+        "--output must be a folder. 0 (default) stitches everything into one mosaic.",
     )
     p.add_argument(
         "--dry-run",
@@ -117,6 +132,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    if args.stride < 1:
+        print("error: --stride must be >= 1.", file=sys.stderr)
+        return 2
+    ordered = stride_frames(ordered, args.stride)
+
     if args.dry_run:
         _print_dry_run(ordered)
         return 0
@@ -145,13 +165,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not args.quiet:
             print(f"[{i + 1}/{total}] {msg}", file=sys.stderr)
 
+    import cv2
+
+    # --- batch mode: one mosaic per N frames into an output folder ---
+    if args.batch_size and args.batch_size > 0:
+        groups = chunk_frames(ordered, args.batch_size)
+        out_dir = Path(args.output)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        written = failed = 0
+        for gi, group in enumerate(groups):
+            if not args.quiet:
+                print(f"== mosaic {gi + 1}/{len(groups)} ({len(group)} frames) ==",
+                      file=sys.stderr)
+            try:
+                mosaic = stitch_frames(group, cfg, progress=progress)
+            except StitchError as exc:
+                failed += 1
+                print(f"  skipped mosaic {gi + 1}: {exc}", file=sys.stderr)
+                continue
+            dest = out_dir / f"mosaic_{gi + 1:03d}_{group[0].path.stem}_to_{group[-1].path.stem}.jpg"
+            if cv2.imwrite(str(dest), mosaic):
+                written += 1
+                print(f"Wrote {dest}")
+            else:
+                failed += 1
+                print(f"  failed to write {dest}", file=sys.stderr)
+        print(f"Done: {written} mosaic(s) written, {failed} skipped/failed.")
+        return 0 if failed == 0 else 1
+
+    # --- single mosaic ---
     try:
         mosaic = stitch_frames(ordered, cfg, progress=progress)
     except StitchError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-
-    import cv2
 
     out_path = Path(args.output)
     if out_path.parent and not out_path.parent.exists():

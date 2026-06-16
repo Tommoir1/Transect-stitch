@@ -33,9 +33,32 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
-This installs the `transect-stitch` console command (and `python -m transect_stitch`).
+This installs two commands: `transect-stitch` (CLI) and `transect-stitch-gui`
+(desktop GUI). The library is also importable as `transect_stitch`.
 
-## Usage
+> The GUI uses **Tkinter**, which ships with most Python installs. On Linux you may
+> need the system package first: `sudo apt install python3-tk`.
+
+## GUI
+
+```bash
+transect-stitch-gui
+```
+
+A simple window where you can:
+
+- **Add Images…** or **Add Folder…**, then see them in transect order (the list
+  updates live; `[gps]`/`[exif]` tags show where each frame's order came from).
+- Stitch a **single mosaic** from all the images, **or**
+- Run in **batch** mode — "one mosaic every N images" (e.g. every 40) — writing one
+  output file per group into a folder you pick.
+- Tune the detector, blending, downscale (`Max dim`), and **Use every Nth image**
+  (handy to thin dense time-lapses).
+
+Stitching runs on a background thread with a progress bar and log, and in batch mode a
+group that can't be registered is skipped (logged) rather than aborting the whole run.
+
+## Usage (CLI)
 
 ```bash
 # Stitch every image in a folder, ordered by GPS time, into one mosaic
@@ -49,6 +72,12 @@ transect-stitch ./survey_images --dry-run
 
 # Order strictly by filename (e.g. frame_0001.jpg) when metadata is missing
 transect-stitch ./frames -o out.jpg --order filename
+
+# Thin a dense time-lapse: use every 3rd frame
+transect-stitch ./frames -o out.jpg --stride 3
+
+# Batch mode: one mosaic per 40 frames, written into ./mosaics/
+transect-stitch ./frames -o ./mosaics --batch-size 40
 ```
 
 Run `transect-stitch --help` for the full option list.

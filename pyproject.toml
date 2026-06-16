@@ -22,6 +22,7 @@ dev = ["pytest>=7.0"]
 
 [project.scripts]
 transect-stitch = "transect_stitch.cli:main"
+transect-stitch-gui = "transect_stitch.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

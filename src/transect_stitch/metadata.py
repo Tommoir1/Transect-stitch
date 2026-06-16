@@ -215,6 +215,34 @@ def order_frames(frames: Iterable[FrameInfo], strategy: str = ORDER_AUTO) -> lis
     raise ValueError(f"Unknown order strategy: {strategy!r}")
 
 
+def stride_frames(frames: Sequence[FrameInfo], stride: int) -> list[FrameInfo]:
+    """Keep every ``stride``-th frame (``stride=1`` keeps all).
+
+    Useful for thinning dense time-lapses where consecutive frames overlap
+    almost entirely (e.g. 1 m/s with a photo every 0.5 s).
+    """
+    if stride < 1:
+        raise ValueError("stride must be >= 1")
+    return list(frames[::stride])
+
+
+def chunk_frames(
+    frames: Sequence[FrameInfo], size: int, include_remainder: bool = True
+) -> list[list[FrameInfo]]:
+    """Split frames into consecutive groups of ``size`` (for batch mosaicking).
+
+    The final group may be smaller than ``size``; set ``include_remainder=False``
+    to drop a trailing partial group instead of emitting a short mosaic.
+    """
+    if size < 1:
+        raise ValueError("chunk size must be >= 1")
+    frames = list(frames)
+    chunks = [frames[i : i + size] for i in range(0, len(frames), size)]
+    if chunks and not include_remainder and len(chunks[-1]) < size:
+        chunks.pop()
+    return chunks
+
+
 def gps_gaps_m(frames: Sequence[FrameInfo]) -> list[Optional[float]]:
     """Distance (m) between each frame and the previous one with GPS.
 

@@ -6,9 +6,11 @@ from transect_stitch.metadata import (
     ORDER_FILENAME,
     ORDER_TIME,
     FrameInfo,
+    chunk_frames,
     discover_images,
     gps_gaps_m,
     order_frames,
+    stride_frames,
 )
 
 
@@ -60,3 +62,26 @@ def test_discover_images_filters_extensions(tmp_path):
 
 def test_empty_inputs():
     assert order_frames([], ORDER_AUTO) == []
+
+
+def test_stride_keeps_every_nth():
+    frames = [_frame(f"f{i}.jpg") for i in range(10)]
+    kept = stride_frames(frames, 3)
+    assert [f.path.name for f in kept] == ["f0.jpg", "f3.jpg", "f6.jpg", "f9.jpg"]
+
+
+def test_stride_one_keeps_all():
+    frames = [_frame(f"f{i}.jpg") for i in range(4)]
+    assert len(stride_frames(frames, 1)) == 4
+
+
+def test_chunk_frames_with_remainder():
+    frames = [_frame(f"f{i}.jpg") for i in range(7)]
+    chunks = chunk_frames(frames, 3)
+    assert [len(c) for c in chunks] == [3, 3, 1]
+
+
+def test_chunk_frames_drop_remainder():
+    frames = [_frame(f"f{i}.jpg") for i in range(7)]
+    chunks = chunk_frames(frames, 3, include_remainder=False)
+    assert [len(c) for c in chunks] == [3, 3]
