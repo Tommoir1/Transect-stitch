@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "transect-stitch"
+version = "0.1.0"
+description = "Stitch USV transect imagery (time-lapse or individual photos with GPS timestamps) into one long mosaic."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Tommoir1" }]
+keywords = ["image-stitching", "mosaic", "transect", "usv", "gps", "opencv", "survey"]
+dependencies = [
+    "numpy>=1.23",
+    "opencv-python>=4.7",
+    "Pillow>=9.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+transect-stitch = "transect_stitch.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
