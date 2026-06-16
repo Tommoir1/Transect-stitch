@@ -78,7 +78,30 @@ transect-stitch ./frames -o out.jpg --stride 3
 
 # Batch mode: one mosaic per 40 frames, written into ./mosaics/
 transect-stitch ./frames -o ./mosaics --batch-size 40
+
+# Hard case: GoPro / wide-angle underwater footage (fisheye + low contrast)
+transect-stitch ./frames -o ./mosaics --batch-size 40 \
+    --undistort -0.3 --detector sift --max-features 8000
 ```
+
+## Hard imagery (wide-angle / underwater)
+
+Action-cam footage (GoPro etc.) and underwater scenes are the difficult case,
+and three options exist specifically for them:
+
+- `--undistort K1` — wide-angle/fisheye lenses curve straight lines, which the
+  affine registration model can't fit, so RANSAC throws out almost every match.
+  A negative `K1` (start around `-0.3` for a GoPro) straightens the frame so
+  pairs actually register. `0` (default) leaves frames untouched.
+- **CLAHE** (on by default; disable with `--no-clahe`) lifts local contrast on
+  hazy/low-contrast underwater frames, surfacing far more features.
+- `--max-skip N` (default 5) — a single blurry or textureless frame is now
+  *dropped* and the mosaic continues from the last good frame, instead of the
+  whole run aborting. Failures report how many matches were geometrically
+  consistent, so you can tell "no overlap" from "too much lens distortion".
+
+If a mosaic still won't form, try a lower `--stride`, `--detector sift`, or a
+slightly stronger `--undistort`.
 
 Run `transect-stitch --help` for the full option list.
 

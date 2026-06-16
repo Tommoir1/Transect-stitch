@@ -65,7 +65,38 @@ def _build_parser() -> argparse.ArgumentParser:
         "--min-matches",
         type=int,
         default=12,
-        help="Minimum good matches to accept a pair (default: 12).",
+        help="Minimum geometrically consistent (RANSAC inlier) matches to accept a "
+        "pair (default: 12).",
+    )
+    p.add_argument(
+        "--undistort",
+        type=float,
+        default=0.0,
+        metavar="K1",
+        help="Radial lens-correction strength for wide-angle/fisheye footage "
+        "(e.g. -0.3 for a GoPro). 0 (default) = off. Negative values straighten "
+        "barrel distortion so frames actually register.",
+    )
+    p.add_argument(
+        "--no-clahe",
+        dest="clahe",
+        action="store_false",
+        help="Disable CLAHE contrast enhancement before feature detection "
+        "(on by default; helps low-contrast underwater frames).",
+    )
+    p.add_argument(
+        "--min-inlier-ratio",
+        type=float,
+        default=0.0,
+        help="If >0, also require inliers/matches >= this fraction to accept a pair "
+        "(rejects low-confidence registrations; default: 0 = off).",
+    )
+    p.add_argument(
+        "--max-skip",
+        type=int,
+        default=5,
+        help="Consecutive un-registerable frames to drop before giving up on a "
+        "mosaic (default: 5). A single blurry frame won't abort the run.",
     )
     p.add_argument(
         "--stride",
@@ -159,6 +190,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         min_matches=args.min_matches,
         blend=args.blend,
         max_dim=args.max_dim,
+        undistort=args.undistort,
+        clahe=args.clahe,
+        min_inlier_ratio=args.min_inlier_ratio,
+        max_skip=args.max_skip,
     )
 
     def progress(i, total, msg):

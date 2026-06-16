@@ -33,10 +33,17 @@ class StitchConfig:
     detector: str = "orb"  # "orb" | "sift"
     max_features: int = 4000
     ratio: float = 0.75  # Lowe ratio test threshold
-    min_matches: int = 12  # min good matches to trust a pair
+    min_matches: int = 12  # min RANSAC inliers to trust a pair
     ransac_thresh: float = 4.0  # reprojection tolerance (px)
     blend: str = "feather"  # "feather" | "overwrite"
     max_dim: int = 0  # if >0, downscale each frame so max(h,w) <= max_dim
+
+    # --- robustness for hard imagery (e.g. underwater / wide-angle action cams) ---
+    undistort: float = 0.0  # radial lens-correction strength k1 (e.g. -0.3 for GoPro); 0 = off
+    clahe: bool = True  # contrast-limited adaptive equalisation before feature detection
+    min_inlier_ratio: float = 0.0  # if >0, also require inliers / good-matches >= this
+    max_scale: float = 4.0  # reject a pair whose estimated scale jump exceeds this (0 = off)
+    max_skip: int = 5  # consecutive un-registerable frames to drop before giving up
 
 
 class StitchError(RuntimeError):
@@ -65,12 +72,33 @@ def _build_matcher(cfg: StitchConfig):
     return cv2.BFMatcher(norm, crossCheck=False)
 
 
+def _undistort(img, k1: float, k2: float = 0.0):
+    """Approximate radial lens correction (negative k1 straightens barrel/fisheye).
+
+    No calibration is available, so we assume a centred principal point and a
+    focal length of the longest image side. This is rough but enough to stop the
+    edges of a wide-angle frame curving — which is what breaks the affine model
+    on action-cam footage. The central overlap region (where most matches live)
+    is straightened, letting RANSAC find far more consistent inliers.
+    """
+    import cv2
+    import numpy as np
+
+    h, w = img.shape[:2]
+    f = float(max(w, h))
+    k = np.array([[f, 0.0, w / 2.0], [0.0, f, h / 2.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    d = np.array([k1, k2, 0.0, 0.0], dtype=np.float64)
+    return cv2.undistort(img, k, d)
+
+
 def _load_image(path: Path, cfg: StitchConfig):
     import cv2
 
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
         raise StitchError(f"Could not read image: {path}")
+    if cfg.undistort != 0.0:
+        img = _undistort(img, cfg.undistort)
     if cfg.max_dim > 0:
         h, w = img.shape[:2]
         longest = max(h, w)
@@ -78,6 +106,21 @@ def _load_image(path: Path, cfg: StitchConfig):
             scale = cfg.max_dim / longest
             img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     return img
+
+
+def _detect_gray(img, cfg: StitchConfig):
+    """Grayscale used for feature detection, optionally CLAHE-enhanced.
+
+    Underwater / low-contrast frames give up far more features once local
+    contrast is equalised, so this is on by default.
+    """
+    import cv2
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if cfg.clahe:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+    return gray
 
 
 def _good_matches(matcher, desc1, desc2, ratio: float):
@@ -95,20 +138,36 @@ def _good_matches(matcher, desc1, desc2, ratio: float):
 
 
 def _estimate_pairwise(kp1, kp2, matches, cfg: StitchConfig):
-    """Partial-affine 2x3 mapping points in frame2 -> frame1, or None."""
+    """Estimate a partial-affine 2x3 mapping frame2 -> frame1.
+
+    Returns ``(matrix_or_None, n_inliers)``. ``matrix`` is ``None`` when the
+    pair cannot be trusted; ``n_inliers`` is reported either way so callers can
+    explain *why* a registration was rejected (too few geometrically consistent
+    matches, not just too few raw matches).
+    """
     import cv2
     import numpy as np
 
     if len(matches) < cfg.min_matches:
-        return None
+        return None, 0
     src = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
     dst = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
     matrix, inliers = cv2.estimateAffinePartial2D(
         src, dst, method=cv2.RANSAC, ransacReprojThreshold=cfg.ransac_thresh
     )
-    if matrix is None or inliers is None or int(inliers.sum()) < cfg.min_matches:
-        return None
-    return matrix
+    if matrix is None or inliers is None:
+        return None, 0
+    n_inliers = int(inliers.sum())
+    if n_inliers < cfg.min_matches:
+        return None, n_inliers
+    if cfg.min_inlier_ratio > 0 and n_inliers < cfg.min_inlier_ratio * len(matches):
+        return None, n_inliers
+    # Guard against degenerate fits that imply an implausible zoom between
+    # consecutive transect frames (scale should be ~1).
+    scale = float(np.sqrt(abs(matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0])))
+    if cfg.max_scale > 0 and (scale > cfg.max_scale or scale < 1.0 / cfg.max_scale):
+        return None, n_inliers
+    return matrix, n_inliers
 
 
 def _to_3x3(affine):
@@ -146,37 +205,58 @@ def stitch_frames(
     # First frame anchors the global coordinate system at identity.
     report(0, f"loading {frames[0].path.name}")
     base = _load_image(frames[0].path, cfg)
-    prev_gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
-    prev_kp, prev_desc = detector.detectAndCompute(prev_gray, None)
-
-    global_h = [np.eye(3, dtype=np.float64)]  # frame i -> global
-    images = [base]
-
     if total == 1:
         return base
+    anchor_kp, anchor_desc = detector.detectAndCompute(_detect_gray(base, cfg), None)
+    anchor_name = frames[0].path.name
 
-    cur_global = np.eye(3, dtype=np.float64)
+    global_h = [np.eye(3, dtype=np.float64)]  # placed frame i -> global
+    images = [base]
+    cur_global = np.eye(3, dtype=np.float64)  # global transform of the current anchor
+
+    skipped = 0
+    consecutive_skips = 0
     for i in range(1, total):
         report(i, f"registering {frames[i].path.name}")
         img = _load_image(frames[i].path, cfg)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        kp, desc = detector.detectAndCompute(gray, None)
+        kp, desc = detector.detectAndCompute(_detect_gray(img, cfg), None)
 
-        matches = _good_matches(matcher, prev_desc, desc, cfg.ratio)
-        affine = _estimate_pairwise(prev_kp, kp, matches, cfg)
+        # Match against the last *successfully placed* frame, so a single bad
+        # (blurry / textureless) frame is bridged over rather than aborting.
+        matches = _good_matches(matcher, anchor_desc, desc, cfg.ratio)
+        affine, n_inliers = _estimate_pairwise(anchor_kp, kp, matches, cfg)
         if affine is None:
-            raise StitchError(
-                f"Could not register frame {i} ({frames[i].path.name}) to the "
-                f"previous frame: only {len(matches)} good matches "
-                f"(need >= {cfg.min_matches}). The overlap or texture is too low."
+            skipped += 1
+            consecutive_skips += 1
+            report(
+                i,
+                f"  dropped {frames[i].path.name}: {len(matches)} matches but only "
+                f"{n_inliers} geometrically consistent (need >= {cfg.min_matches})",
             )
+            if consecutive_skips > cfg.max_skip:
+                raise StitchError(
+                    f"Lost registration: {consecutive_skips} frames in a row could not "
+                    f"be matched to '{anchor_name}'. The overlap or texture is too low "
+                    f"(last try: {len(matches)} matches, {n_inliers} inliers). Try a "
+                    f"lower --stride, --detector sift, or --undistort for wide-angle lenses."
+                )
+            continue
 
-        # affine maps current -> previous; compose onto previous global transform.
+        # affine maps current -> anchor; compose onto the anchor's global transform.
         cur_global = cur_global @ _to_3x3(affine)
         global_h.append(cur_global.copy())
         images.append(img)
+        anchor_kp, anchor_desc, anchor_name = kp, desc, frames[i].path.name
+        consecutive_skips = 0
 
-        prev_kp, prev_desc, prev_gray = kp, desc, gray
+    if len(images) == 1:
+        raise StitchError(
+            "Only the first frame could be placed; no other frame registered to it. "
+            "Check ordering/overlap, or try --detector sift and (for wide-angle "
+            "footage) --undistort."
+        )
+    if skipped:
+        report(total - 1, f"placed {len(images)}/{total} frames ({skipped} dropped)")
 
     return _compose_canvas(images, global_h, cfg)
 

@@ -112,6 +112,12 @@ class StitchApp:
         self.stride_var = tk.IntVar(value=1)
         ttk.Spinbox(opt, from_=1, to=100, textvariable=self.stride_var, width=5,
                     command=self._refresh_list).grid(row=1, column=1, sticky="w")
+        ttk.Label(opt, text="Undistort (k1, 0=off):").grid(row=1, column=2, sticky="w", padx=4)
+        self.undistort_var = tk.StringVar(value="0.0")
+        ttk.Entry(opt, textvariable=self.undistort_var, width=7).grid(row=1, column=3, sticky="w")
+        self.clahe_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="Enhance contrast (CLAHE)", variable=self.clahe_var).grid(
+            row=1, column=4, columnspan=2, sticky="w", padx=4)
 
         # --- mode ---
         mode = ttk.LabelFrame(self.root, text="Mode")
@@ -262,6 +268,11 @@ class StitchApp:
         except ValueError:
             messagebox.showerror("Transect Stitch", "Max dim must be a whole number.")
             return
+        try:
+            undistort = float(self.undistort_var.get())
+        except ValueError:
+            messagebox.showerror("Transect Stitch", "Undistort (k1) must be a number.")
+            return
 
         # Build config + job description on the main thread, then hand to worker.
         from .stitch import StitchConfig
@@ -270,6 +281,8 @@ class StitchApp:
             detector=self.detector_var.get(),
             blend=self.blend_var.get(),
             max_dim=max_dim,
+            undistort=undistort,
+            clahe=self.clahe_var.get(),
         )
         batch = self.mode_var.get() == "batch"
         if batch:
