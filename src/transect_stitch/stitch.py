@@ -41,9 +41,37 @@ class StitchConfig:
     # --- robustness for hard imagery (e.g. underwater / wide-angle action cams) ---
     undistort: float = 0.0  # radial lens-correction strength k1 (e.g. -0.3 for GoPro); 0 = off
     clahe: bool = True  # contrast-limited adaptive equalisation before feature detection
+    transform: str = "affine"  # "affine" (rigid-ish) | "homography" (planar perspective)
     min_inlier_ratio: float = 0.0  # if >0, also require inliers / good-matches >= this
     max_scale: float = 4.0  # reject a pair whose estimated scale jump exceeds this (0 = off)
     max_skip: int = 5  # consecutive un-registerable frames to drop before giving up
+
+
+# Presets bundle settings for common, awkward capture types so users don't have
+# to hand-tune several knobs. Applied as overrides on top of the defaults.
+PRESETS = {
+    "underwater": dict(
+        detector="sift",
+        max_features=8000,
+        ratio=0.9,  # repetitive algae/coral texture -> admit more matches, let RANSAC filter
+        ransac_thresh=10.0,  # fisheye + motion blur -> looser geometric tolerance
+        min_matches=8,
+        undistort=-0.3,  # straighten GoPro barrel distortion
+        clahe=True,
+        transform="homography",  # flat seabed through a wide lens is a planar perspective
+    ),
+}
+
+
+def apply_preset(cfg: "StitchConfig", name: str) -> "StitchConfig":
+    """Return a copy of ``cfg`` with the named preset's overrides applied."""
+    if not name or name == "none":
+        return cfg
+    if name not in PRESETS:
+        raise StitchError(f"Unknown preset: {name!r} (known: {', '.join(PRESETS)}).")
+    import dataclasses
+
+    return dataclasses.replace(cfg, **PRESETS[name])
 
 
 class StitchError(RuntimeError):
@@ -138,12 +166,13 @@ def _good_matches(matcher, desc1, desc2, ratio: float):
 
 
 def _estimate_pairwise(kp1, kp2, matches, cfg: StitchConfig):
-    """Estimate a partial-affine 2x3 mapping frame2 -> frame1.
+    """Estimate a 3x3 transform mapping frame2 -> frame1.
 
-    Returns ``(matrix_or_None, n_inliers)``. ``matrix`` is ``None`` when the
-    pair cannot be trusted; ``n_inliers`` is reported either way so callers can
-    explain *why* a registration was rejected (too few geometrically consistent
-    matches, not just too few raw matches).
+    Uses a partial-affine (rigid-ish) model by default, or a full homography
+    when ``cfg.transform == 'homography'`` (better for a flat scene viewed
+    through a wide/fisheye lens). Returns ``(matrix3x3_or_None, n_inliers)``;
+    ``n_inliers`` is reported even on rejection so callers can explain *why* a
+    pair failed (too few geometrically consistent matches, not just raw matches).
     """
     import cv2
     import numpy as np
@@ -152,11 +181,17 @@ def _estimate_pairwise(kp1, kp2, matches, cfg: StitchConfig):
         return None, 0
     src = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
     dst = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-    matrix, inliers = cv2.estimateAffinePartial2D(
-        src, dst, method=cv2.RANSAC, ransacReprojThreshold=cfg.ransac_thresh
-    )
+
+    if cfg.transform == "homography":
+        matrix, inliers = cv2.findHomography(src, dst, cv2.RANSAC, cfg.ransac_thresh)
+    else:
+        affine, inliers = cv2.estimateAffinePartial2D(
+            src, dst, method=cv2.RANSAC, ransacReprojThreshold=cfg.ransac_thresh
+        )
+        matrix = _to_3x3(affine) if affine is not None else None
     if matrix is None or inliers is None:
         return None, 0
+
     n_inliers = int(inliers.sum())
     if n_inliers < cfg.min_matches:
         return None, n_inliers
@@ -224,8 +259,8 @@ def stitch_frames(
         # Match against the last *successfully placed* frame, so a single bad
         # (blurry / textureless) frame is bridged over rather than aborting.
         matches = _good_matches(matcher, anchor_desc, desc, cfg.ratio)
-        affine, n_inliers = _estimate_pairwise(anchor_kp, kp, matches, cfg)
-        if affine is None:
+        pair_h, n_inliers = _estimate_pairwise(anchor_kp, kp, matches, cfg)
+        if pair_h is None:
             skipped += 1
             consecutive_skips += 1
             report(
@@ -242,8 +277,8 @@ def stitch_frames(
                 )
             continue
 
-        # affine maps current -> anchor; compose onto the anchor's global transform.
-        cur_global = cur_global @ _to_3x3(affine)
+        # pair_h maps current -> anchor; compose onto the anchor's global transform.
+        cur_global = cur_global @ pair_h
         global_h.append(cur_global.copy())
         images.append(img)
         anchor_kp, anchor_desc, anchor_name = kp, desc, frames[i].path.name

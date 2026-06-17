@@ -79,29 +79,40 @@ transect-stitch ./frames -o out.jpg --stride 3
 # Batch mode: one mosaic per 40 frames, written into ./mosaics/
 transect-stitch ./frames -o ./mosaics --batch-size 40
 
-# Hard case: GoPro / wide-angle underwater footage (fisheye + low contrast)
-transect-stitch ./frames -o ./mosaics --batch-size 40 \
-    --undistort -0.3 --detector sift --max-features 8000
+# Hard case: GoPro / wide-angle underwater footage — one-flag preset
+transect-stitch ./frames -o ./mosaics --batch-size 40 --preset underwater
+
+# Stitch straight from a video (extracts frames automatically)
+transect-stitch dive.mp4 -o ./mosaics --batch-size 40 --preset underwater
 ```
 
 ## Hard imagery (wide-angle / underwater)
 
-Action-cam footage (GoPro etc.) and underwater scenes are the difficult case,
-and three options exist specifically for them:
+Action-cam footage (GoPro etc.) and underwater reef scenes are the difficult
+case. The easiest path is `--preset underwater`, which bundles the settings
+below; you can still override any of them with an explicit flag.
 
+- `--preset underwater` — sets SIFT, looser matching (`--ratio 0.9`,
+  `--ransac-thresh 10`), lens correction (`--undistort -0.3`), and a homography
+  motion model. Tuned for fisheye + low-contrast + repetitive coral texture.
 - `--undistort K1` — wide-angle/fisheye lenses curve straight lines, which the
-  affine registration model can't fit, so RANSAC throws out almost every match.
-  A negative `K1` (start around `-0.3` for a GoPro) straightens the frame so
-  pairs actually register. `0` (default) leaves frames untouched.
-- **CLAHE** (on by default; disable with `--no-clahe`) lifts local contrast on
-  hazy/low-contrast underwater frames, surfacing far more features.
-- `--max-skip N` (default 5) — a single blurry or textureless frame is now
-  *dropped* and the mosaic continues from the last good frame, instead of the
-  whole run aborting. Failures report how many matches were geometrically
-  consistent, so you can tell "no overlap" from "too much lens distortion".
+  affine model can't fit, so RANSAC discards most matches. A negative `K1`
+  (around `-0.3` for a GoPro) straightens the frame. `0` (default) = off.
+- `--ratio` — Lowe ratio test (default 0.75). Repetitive texture makes matches
+  ambiguous; raising to ~0.9 admits more, and RANSAC filters them.
+- `--ransac-thresh` — reprojection tolerance in px (default 4). Raising to ~10
+  tolerates the residual distortion/blur that a single model can't perfectly fit.
+- `--transform homography` — a planar-perspective model, more appropriate than
+  affine for a flat seabed viewed through a wide lens.
+- **CLAHE** (on by default; `--no-clahe` to disable) lifts local contrast on
+  hazy frames, surfacing far more features.
+- `--max-skip N` (default 5) — a single blurry/textureless frame is dropped and
+  the mosaic continues from the last good frame instead of aborting. Failures
+  report how many matches were geometrically consistent.
 
-If a mosaic still won't form, try a lower `--stride`, `--detector sift`, or a
-slightly stronger `--undistort`.
+Still stuck? Use `transect-stitch-inspect frameA.jpg frameB.jpg` to see the
+match breakdown and a visualisation for one pair, which tells you whether the
+frames overlap at all or are just hard to match.
 
 Run `transect-stitch --help` for the full option list.
 

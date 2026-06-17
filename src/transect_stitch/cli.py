@@ -51,10 +51,39 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Frame ordering strategy (default: auto).",
     )
     p.add_argument(
+        "--preset",
+        choices=["none", "underwater"],
+        default="none",
+        help="Apply a bundle of settings for a known-awkward capture type. "
+        "'underwater' tunes for GoPro reef footage (SIFT, looser matching, "
+        "lens correction, homography). Explicit flags override the preset.",
+    )
+    p.add_argument(
         "--detector",
         choices=["orb", "sift"],
         default="orb",
         help="Feature detector (default: orb). SIFT is more robust but slower.",
+    )
+    p.add_argument(
+        "--transform",
+        choices=["affine", "homography"],
+        default="affine",
+        help="Motion model per pair: affine (rigid-ish, default) or homography "
+        "(planar perspective — better for flat scenes through a wide lens).",
+    )
+    p.add_argument(
+        "--ratio",
+        type=float,
+        default=0.75,
+        help="Lowe ratio-test threshold (default: 0.75). Higher (e.g. 0.9) admits "
+        "more matches on repetitive texture; RANSAC then filters them.",
+    )
+    p.add_argument(
+        "--ransac-thresh",
+        type=float,
+        default=4.0,
+        help="RANSAC reprojection tolerance in px (default: 4). Higher (e.g. 10) "
+        "tolerates residual lens distortion / blur.",
     )
     p.add_argument(
         "--blend",
@@ -217,23 +246,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Import the heavy path only once we know we're actually stitching.
     try:
-        from .stitch import StitchConfig, StitchError, stitch_frames
+        import dataclasses
+
+        from .stitch import StitchConfig, StitchError, apply_preset, stitch_frames
     except ImportError as exc:  # pragma: no cover
         print(f"error: imaging dependencies missing ({exc}). Run 'pip install -e .'.",
               file=sys.stderr)
         return 3
 
-    cfg = StitchConfig(
-        detector=args.detector,
-        max_features=args.max_features,
-        min_matches=args.min_matches,
-        blend=args.blend,
-        max_dim=args.max_dim,
-        undistort=args.undistort,
-        clahe=args.clahe,
-        min_inlier_ratio=args.min_inlier_ratio,
-        max_skip=args.max_skip,
-    )
+    # Start from the preset (if any), then let explicitly-passed flags override it.
+    argv_list = list(argv) if argv is not None else sys.argv[1:]
+    cfg = apply_preset(StitchConfig(), args.preset)
+    overrides = {}
+    for dest, flags in {
+        "detector": ["--detector"], "transform": ["--transform"], "ratio": ["--ratio"],
+        "ransac_thresh": ["--ransac-thresh"], "max_features": ["--max-features"],
+        "min_matches": ["--min-matches"], "undistort": ["--undistort"],
+        "blend": ["--blend"], "max_dim": ["--max-dim"], "clahe": ["--no-clahe"],
+        "min_inlier_ratio": ["--min-inlier-ratio"], "max_skip": ["--max-skip"],
+    }.items():
+        if any(a == f or a.startswith(f + "=") for a in argv_list for f in flags):
+            overrides[dest] = getattr(args, dest)
+    cfg = dataclasses.replace(cfg, **overrides)
 
     def progress(i, total, msg):
         if not args.quiet:

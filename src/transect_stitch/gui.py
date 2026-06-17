@@ -88,6 +88,15 @@ class StitchApp:
         order_box.pack(side="left")
         order_box.bind("<<ComboboxSelected>>", lambda _e: self._refresh_list())
 
+        ttk.Label(top, text="Preset:").pack(side="left", padx=(16, 2))
+        self.preset_var = tk.StringVar(value="none")
+        preset_box = ttk.Combobox(
+            top, textvariable=self.preset_var,
+            values=["none", "underwater"], state="readonly", width=11,
+        )
+        preset_box.pack(side="left")
+        preset_box.bind("<<ComboboxSelected>>", lambda _e: self._apply_preset_widgets())
+
         # --- image list ---
         mid = ttk.Frame(self.root)
         mid.pack(fill="both", expand=True, **pad)
@@ -278,6 +287,19 @@ class StitchApp:
         else:
             self.root.title(f"Transect Stitch — {n} image(s)")
 
+    def _apply_preset_widgets(self) -> None:
+        """Reflect the chosen preset in the visible option widgets."""
+        from .stitch import PRESETS
+
+        preset = self.preset_var.get()
+        if preset in PRESETS:
+            opts = PRESETS[preset]
+            self.detector_var.set(opts.get("detector", self.detector_var.get()))
+            self.undistort_var.set(str(opts.get("undistort", self.undistort_var.get())))
+            self.clahe_var.set(opts.get("clahe", self.clahe_var.get()))
+            self._log(f"Applied '{preset}' preset (SIFT, lens correction, looser matching, "
+                      "homography). You can still tweak individual options.")
+
     def _update_mode(self) -> None:
         batch = self.mode_var.get() == "batch"
         self.out_btn.config(text="Output folder…" if batch else "Output file…")
@@ -322,9 +344,15 @@ class StitchApp:
             return
 
         # Build config + job description on the main thread, then hand to worker.
-        from .stitch import StitchConfig
+        import dataclasses
 
-        cfg = StitchConfig(
+        from .stitch import StitchConfig, apply_preset
+
+        # Preset supplies the hidden knobs (transform/ratio/ransac); the visible
+        # widgets override on top so what's shown is what runs.
+        cfg = apply_preset(StitchConfig(), self.preset_var.get())
+        cfg = dataclasses.replace(
+            cfg,
             detector=self.detector_var.get(),
             blend=self.blend_var.get(),
             max_dim=max_dim,
