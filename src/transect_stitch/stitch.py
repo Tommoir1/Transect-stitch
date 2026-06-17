@@ -45,6 +45,7 @@ class StitchConfig:
     min_inlier_ratio: float = 0.0  # if >0, also require inliers / good-matches >= this
     max_scale: float = 4.0  # reject a pair whose estimated scale jump exceeds this (0 = off)
     max_skip: int = 5  # consecutive un-registerable frames to drop before giving up
+    motion_filter: bool = True  # drop matches whose displacement disagrees with the dominant motion
 
 
 # Presets bundle settings for common, awkward capture types so users don't have
@@ -165,6 +166,48 @@ def _good_matches(matcher, desc1, desc2, ratio: float):
     return good
 
 
+def _filter_by_motion(kp1, kp2, matches, min_keep: int = 12):
+    """Keep only matches whose displacement agrees with the dominant motion.
+
+    Consecutive transect frames overlap heavily, so genuine correspondences all
+    shift by a similar vector; repetitive-texture false matches (one coral head
+    mistaken for another) point every which way. Restricting to matches near the
+    *median* displacement strips that scatter before RANSAC ever runs — which,
+    on self-similar reef texture, is the difference between locking onto the few
+    hundred real matches and drowning in a thousand false ones.
+
+    The band is deliberately generous (scaled to the spread actually present) so
+    real rotation/scale across the frame survives; if filtering would leave too
+    few matches it backs off and returns the full set unchanged.
+    """
+    import numpy as np
+
+    if len(matches) < min_keep:
+        return matches
+    dx = np.array([kp1[m.queryIdx].pt[0] - kp2[m.trainIdx].pt[0] for m in matches])
+    dy = np.array([kp1[m.queryIdx].pt[1] - kp2[m.trainIdx].pt[1] for m in matches])
+    mx, my = float(np.median(dx)), float(np.median(dy))
+    band_x = max(8.0, 5.0 * float(np.median(np.abs(dx - mx))))
+    band_y = max(8.0, 5.0 * float(np.median(np.abs(dy - my))))
+    keep = [
+        m
+        for m, ddx, ddy in zip(matches, dx, dy)
+        if abs(ddx - mx) <= band_x and abs(ddy - my) <= band_y
+    ]
+    return keep if len(keep) >= min_keep else matches
+
+
+def _ransac_method():
+    """Prefer MAGSAC++ (USAC) when the OpenCV build has it.
+
+    MAGSAC is markedly better than plain RANSAC at low inlier ratios — exactly
+    the regime hard underwater pairs fall into — and needs no threshold tuning.
+    """
+    import cv2
+
+    return getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)
+
+
 def _estimate_pairwise(kp1, kp2, matches, cfg: StitchConfig):
     """Estimate a 3x3 transform mapping frame2 -> frame1.
 
@@ -183,7 +226,7 @@ def _estimate_pairwise(kp1, kp2, matches, cfg: StitchConfig):
     dst = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
 
     if cfg.transform == "homography":
-        matrix, inliers = cv2.findHomography(src, dst, cv2.RANSAC, cfg.ransac_thresh)
+        matrix, inliers = cv2.findHomography(src, dst, _ransac_method(), cfg.ransac_thresh)
     else:
         affine, inliers = cv2.estimateAffinePartial2D(
             src, dst, method=cv2.RANSAC, ransacReprojThreshold=cfg.ransac_thresh
@@ -259,21 +302,28 @@ def stitch_frames(
         # Match against the last *successfully placed* frame, so a single bad
         # (blurry / textureless) frame is bridged over rather than aborting.
         matches = _good_matches(matcher, anchor_desc, desc, cfg.ratio)
-        pair_h, n_inliers = _estimate_pairwise(anchor_kp, kp, matches, cfg)
+        consistent = (
+            _filter_by_motion(anchor_kp, kp, matches, cfg.min_matches)
+            if cfg.motion_filter
+            else matches
+        )
+        pair_h, n_inliers = _estimate_pairwise(anchor_kp, kp, consistent, cfg)
         if pair_h is None:
             skipped += 1
             consecutive_skips += 1
             report(
                 i,
-                f"  dropped {frames[i].path.name}: {len(matches)} matches but only "
-                f"{n_inliers} geometrically consistent (need >= {cfg.min_matches})",
+                f"  dropped {frames[i].path.name}: {len(matches)} matches -> "
+                f"{len(consistent)} motion-consistent -> {n_inliers} inliers "
+                f"(need >= {cfg.min_matches})",
             )
             if consecutive_skips > cfg.max_skip:
                 raise StitchError(
                     f"Lost registration: {consecutive_skips} frames in a row could not "
                     f"be matched to '{anchor_name}'. The overlap or texture is too low "
-                    f"(last try: {len(matches)} matches, {n_inliers} inliers). Try a "
-                    f"lower --stride, --detector sift, or --undistort for wide-angle lenses."
+                    f"(last try: {len(matches)} matches -> {len(consistent)} "
+                    f"motion-consistent -> {n_inliers} inliers). Try a lower --stride, "
+                    f"--detector sift, or --undistort for wide-angle lenses."
                 )
             continue
 

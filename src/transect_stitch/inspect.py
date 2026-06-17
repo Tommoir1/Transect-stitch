@@ -30,8 +30,10 @@ from .stitch import (
     _build_detector,
     _build_matcher,
     _detect_gray,
+    _filter_by_motion,
     _good_matches,
     _load_image,
+    _ransac_method,
 )
 
 
@@ -105,16 +107,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     good = _good_matches(matcher, desc1, desc2, cfg.ratio)
     print(f"ratio-good matches: {len(good)}")
 
+    consistent = _filter_by_motion(kp1, kp2, good, cfg.min_matches)
+    print(f"motion-consistent matches: {len(consistent)} "
+          f"({100 * len(consistent) / max(1, len(good)):.0f}% of matches share the dominant shift)")
+
     n_inliers = 0
-    if len(good) >= 3:
-        src = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-        dst = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    if len(consistent) >= 3:
+        src = np.float32([kp2[m.trainIdx].pt for m in consistent]).reshape(-1, 1, 2)
+        dst = np.float32([kp1[m.queryIdx].pt for m in consistent]).reshape(-1, 1, 2)
         matrix, inliers = cv2.estimateAffinePartial2D(
-            src, dst, method=cv2.RANSAC, ransacReprojThreshold=cfg.ransac_thresh
+            src, dst, method=_ransac_method(), ransacReprojThreshold=cfg.ransac_thresh
         )
         if inliers is not None:
             n_inliers = int(inliers.sum())
-        print(f"RANSAC inliers: {n_inliers} ({100 * n_inliers / max(1, len(good)):.0f}% of matches)")
+        print(f"RANSAC inliers: {n_inliers} ({100 * n_inliers / max(1, len(consistent)):.0f}% of consistent)")
         if matrix is not None and n_inliers > 0:
             scale = float(np.sqrt(abs(matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0])))
             angle = float(np.degrees(np.arctan2(matrix[1, 0], matrix[0, 0])))
@@ -123,25 +129,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   f"shift=({tx:.0f},{ty:.0f})px of a {img1.shape[1]}px-wide frame")
 
     vis = cv2.drawMatches(
-        img1, kp1, img2, kp2, good, None,
+        img1, kp1, img2, kp2, consistent, None,
         matchColor=(0, 255, 0), singlePointColor=(0, 0, 255),
         flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
     )
     if not cv2.imwrite(args.output, vis):
         print(f"error: could not write {args.output}", file=sys.stderr)
         return 1
-    print(f"wrote {args.output}  (green lines connect matched features A<->B)")
+    print(f"wrote {args.output}  (green lines = motion-consistent matches A<->B)")
 
     # --- plain-language verdict ---
     if len(good) < 12:
         print("\nVERDICT: too few matches -> the frames barely overlap. The capture "
               "interval is likely too coarse for feature stitching.")
-    elif n_inliers < 12:
-        print("\nVERDICT: plenty of matches but few are geometrically consistent. If the "
-              "green lines look like random spaghetti, it's false matches (repetitive "
-              "texture/parallax). If they look parallel, loosening --ransac-thresh may help.")
-    else:
+    elif n_inliers >= 12:
         print("\nVERDICT: this pair registers fine with these settings.")
+    elif len(consistent) >= 12:
+        print("\nVERDICT: enough matches share the dominant motion but RANSAC still "
+              "rejects them -> residual lens distortion or parallax. Try --undistort "
+              "(e.g. -0.3) and/or a looser --ransac-thresh.")
+    else:
+        print("\nVERDICT: many raw matches but almost none share a common motion -> "
+              "false matches from repetitive texture (or genuine parallax / a "
+              "non-overlapping pair). If even the motion filter can't find a consistent "
+              "shift, no single transform fits this pair.")
     return 0
 
 
