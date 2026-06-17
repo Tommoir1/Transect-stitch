@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -19,6 +20,7 @@ from .metadata import (
     order_frames,
     stride_frames,
 )
+from .video import VIDEO_EXTENSIONS, extract_frames, is_video
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -30,7 +32,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "inputs",
         nargs="+",
-        help="Image folder(s), glob(s) (e.g. 'frames/*.jpg'), or individual files.",
+        help="Image folder(s), glob(s) (e.g. 'frames/*.jpg'), individual image files, "
+        "or a video file (.mp4, .mov, .avi …).",
+    )
+    p.add_argument(
+        "--video-stride",
+        type=int,
+        default=5,
+        metavar="N",
+        help="When the input is a video, extract every Nth frame (default: 5). "
+        "At 30 fps, stride 5 = 6 frames/sec. Lower = more overlap but slower.",
     )
     p.add_argument("-o", "--output", help="Output mosaic path (required unless --dry-run).")
     p.add_argument(
@@ -152,16 +163,44 @@ def _print_dry_run(frames) -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
 
-    frames = load_frame_infos(args.inputs)
-    if not frames:
-        print("error: no images found for the given inputs.", file=sys.stderr)
+    # --- video input: extract frames into a temp dir, then stitch as normal ---
+    video_inputs = [Path(i) for i in args.inputs if is_video(Path(i))]
+    if video_inputs and len(args.inputs) > 1:
+        print("error: pass a single video file, not a mix of video and images.",
+              file=sys.stderr)
         return 2
+    if video_inputs:
+        video_path = video_inputs[0]
+        tmp = Path(tempfile.mkdtemp(prefix="transect_stitch_"))
+        if not args.quiet:
+            print(f"Extracting every {args.video_stride}th frame from {video_path.name} …",
+                  file=sys.stderr)
 
-    try:
-        ordered = order_frames(frames, args.order)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        def extract_progress(idx, total, msg):
+            if not args.quiet:
+                print(f"\r  {msg}", end="", file=sys.stderr, flush=True)
+
+        try:
+            frames = extract_frames(
+                video_path, tmp, stride=args.video_stride,
+                max_dim=args.max_dim, progress=extract_progress,
+            )
+        except RuntimeError as exc:
+            print(f"\nerror: {exc}", file=sys.stderr)
+            return 2
+        if not args.quiet:
+            print(f"\n  extracted {len(frames)} frames to {tmp}", file=sys.stderr)
+        ordered = frames  # already in capture order by timestamp
+    else:
+        frames = load_frame_infos(args.inputs)
+        if not frames:
+            print("error: no images found for the given inputs.", file=sys.stderr)
+            return 2
+        try:
+            ordered = order_frames(frames, args.order)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
     if args.stride < 1:
         print("error: --stride must be >= 1.", file=sys.stderr)

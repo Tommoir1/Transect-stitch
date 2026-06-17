@@ -16,6 +16,7 @@ Launch with ``transect-stitch-gui`` or ``python -m transect_stitch.gui``.
 from __future__ import annotations
 
 import queue
+import tempfile
 import threading
 import traceback
 from pathlib import Path
@@ -40,6 +41,10 @@ IMAGE_FILETYPES = [
     ("Images", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp"),
     ("All files", "*.*"),
 ]
+VIDEO_FILETYPES = [
+    ("Videos", "*.mp4 *.mov *.avi *.mkv *.mts *.m2ts *.m4v"),
+    ("All files", "*.*"),
+]
 
 
 class StitchApp:
@@ -52,6 +57,7 @@ class StitchApp:
         self._info_cache: dict[Path, FrameInfo] = {}
         self._paths: List[Path] = []  # as added (pre-ordering)
         self._ordered: List[FrameInfo] = []  # current display/stitch order
+        self._temp_dirs: List[Path] = []  # temp dirs for extracted video frames
         self._events: "queue.Queue[tuple]" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
 
@@ -67,8 +73,9 @@ class StitchApp:
         top.pack(fill="x", **pad)
         ttk.Button(top, text="Add Images…", command=self._add_images).pack(side="left")
         ttk.Button(top, text="Add Folder…", command=self._add_folder).pack(side="left", padx=4)
-        ttk.Button(top, text="Remove Selected", command=self._remove_selected).pack(side="left")
-        ttk.Button(top, text="Clear", command=self._clear).pack(side="left", padx=4)
+        ttk.Button(top, text="Add Video…", command=self._add_video).pack(side="left")
+        ttk.Button(top, text="Remove Selected", command=self._remove_selected).pack(side="left", padx=4)
+        ttk.Button(top, text="Clear", command=self._clear).pack(side="left")
         ttk.Label(top, text="Order:").pack(side="left", padx=(16, 2))
         self.order_var = tk.StringVar(value=ORDER_AUTO)
         order_box = ttk.Combobox(
@@ -118,6 +125,12 @@ class StitchApp:
         self.clahe_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(opt, text="Enhance contrast (CLAHE)", variable=self.clahe_var).grid(
             row=1, column=4, columnspan=2, sticky="w", padx=4)
+        ttk.Label(opt, text="Video: every Nth frame:").grid(row=2, column=0, sticky="w", padx=4, pady=2)
+        self.video_stride_var = tk.IntVar(value=5)
+        ttk.Spinbox(opt, from_=1, to=300, textvariable=self.video_stride_var, width=5).grid(
+            row=2, column=1, sticky="w")
+        ttk.Label(opt, text="(5 = 6 fps from 30 fps video; lower = more overlap)",
+                  foreground="gray").grid(row=2, column=2, columnspan=4, sticky="w", padx=4)
 
         # --- mode ---
         mode = ttk.LabelFrame(self.root, text="Mode")
@@ -170,6 +183,40 @@ class StitchApp:
             return
         exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
         self._add_paths([p for p in Path(folder).iterdir() if p.suffix.lower() in exts])
+
+    def _add_video(self) -> None:
+        path = filedialog.askopenfilename(title="Select a video file",
+                                          filetypes=VIDEO_FILETYPES)
+        if not path:
+            return
+        if self._worker and self._worker.is_alive():
+            messagebox.showwarning("Transect Stitch", "Wait for the current job to finish first.")
+            return
+        stride = max(1, self.video_stride_var.get())
+        video_path = Path(path)
+        self._log(f"Extracting every {stride}th frame from {video_path.name} …")
+        self.stitch_btn.config(state="disabled")
+        self._worker = threading.Thread(
+            target=self._extract_video_worker, args=(video_path, stride), daemon=True
+        )
+        self._worker.start()
+
+    def _extract_video_worker(self, video_path: Path, stride: int) -> None:
+        from .video import extract_frames
+        tmp = Path(tempfile.mkdtemp(prefix="transect_stitch_"))
+        self._temp_dirs.append(tmp)
+
+        def progress(idx, total, msg):
+            self._post("log_replace", msg)
+
+        try:
+            infos = extract_frames(video_path, tmp, stride=stride, progress=progress)
+        except Exception as exc:
+            self._post("log", f"  error extracting video: {exc}")
+            self._post("extract_done", [])
+            return
+        self._post("log", f"  extracted {len(infos)} frames from {video_path.name}")
+        self._post("extract_done", infos)
 
     def _add_paths(self, paths: List[Path]) -> None:
         existing = set(self._paths)
@@ -353,11 +400,26 @@ class StitchApp:
                 kind, payload = self._events.get_nowait()
                 if kind == "log":
                     self._log(payload)
+                elif kind == "log_replace":
+                    # overwrite the last line for progress updates (extraction %)
+                    self.log.config(state="normal")
+                    self.log.delete("end-2l", "end-1c")
+                    self.log.insert("end", payload + "\n")
+                    self.log.see("end")
+                    self.log.config(state="disabled")
                 elif kind == "progress":
                     self.progress.config(value=payload)
                 elif kind == "done":
                     done, failures = payload
                     self._log(f"Finished: {done} mosaic(s) written, {failures} skipped/failed.")
+                    self.stitch_btn.config(state="normal")
+                elif kind == "extract_done":
+                    infos = payload
+                    if infos:
+                        for info in infos:
+                            self._info_cache[info.path] = info
+                        new_paths = [i.path for i in infos]
+                        self._add_paths(new_paths)
                     self.stitch_btn.config(state="normal")
         except queue.Empty:
             pass
